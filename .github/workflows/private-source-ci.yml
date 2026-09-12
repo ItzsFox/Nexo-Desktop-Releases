@@ -1,0 +1,164 @@
+name: Private source CI
+run-name: Nexo Desktop CI - ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit SHA, tag, or branch in the private Nexo-Desktop repository
+        required: true
+        default: main
+        type: string
+  repository_dispatch:
+    types: [nexo-desktop-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexo-desktop-ci-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+env:
+  NEXO_DESKTOP_REF: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.source_ref || inputs.source_ref || 'main' }}
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  AVALONIA_TELEMETRY_OPTOUT: '1'
+  NUGET_XMLDOC_MODE: skip
+
+jobs:
+  windows:
+    name: Windows tests and publish gate
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Require private-source deploy keys
+        shell: bash
+        env:
+          DESKTOP_KEY: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          WEB_KEY: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+        run: |
+          [[ -n "$DESKTOP_KEY" ]] || { echo '::error::Missing NEXO_DESKTOP_DEPLOY_KEY'; exit 1; }
+          [[ -n "$WEB_KEY" ]] || { echo '::error::Missing NEXO_WEB_DEPLOY_KEY'; exit 1; }
+
+      - name: Check out private desktop source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ env.NEXO_DESKTOP_REF }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - id: web-runtime
+        name: Resolve pinned private web runtime
+        shell: bash
+        run: echo "commit=$(git -C source rev-parse 'HEAD:vendor/nexo-web')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned private web runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo
+          ref: ${{ steps.web-runtime.outputs.commit }}
+          path: source/vendor/nexo-web
+          ssh-key: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Verify pinned web runtime
+        shell: pwsh
+        run: |
+          $expected = (Get-Content source/eng/dependencies.lock.json -Raw | ConvertFrom-Json).webRuntime.commit
+          $actual = (git -C source/vendor/nexo-web rev-parse HEAD).Trim()
+          if ($actual -ne $expected) { throw "Web runtime mismatch: $actual" }
+
+      - name: Restore, test, and publish
+        shell: pwsh
+        working-directory: source
+        run: |
+          dotnet restore Nexo.Desktop.slnx --locked-mode
+          dotnet build Nexo.Desktop.slnx -c Release --no-restore
+          dotnet test Nexo.Desktop.slnx -c Release --no-restore --no-build
+          npm ci
+          npm test
+          dotnet publish src/Nexo.Desktop/Nexo.Desktop.csproj -c Release -r win-x64 --self-contained true --no-restore -o artifacts/publish/win-x64
+          ./scripts/verify-release.ps1 -Kind WindowsPublish -Path artifacts/publish/win-x64
+
+  macos:
+    name: macOS managed slices
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Require private-source deploy keys
+        shell: bash
+        env:
+          DESKTOP_KEY: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          WEB_KEY: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+        run: |
+          [[ -n "$DESKTOP_KEY" ]] || { echo '::error::Missing NEXO_DESKTOP_DEPLOY_KEY'; exit 1; }
+          [[ -n "$WEB_KEY" ]] || { echo '::error::Missing NEXO_WEB_DEPLOY_KEY'; exit 1; }
+
+      - name: Check out private desktop source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ env.NEXO_DESKTOP_REF }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - id: web-runtime
+        name: Resolve pinned private web runtime
+        shell: bash
+        run: echo "commit=$(git -C source rev-parse 'HEAD:vendor/nexo-web')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned private web runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo
+          ref: ${{ steps.web-runtime.outputs.commit }}
+          path: source/vendor/nexo-web
+          ssh-key: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Verify pinned web runtime
+        shell: bash
+        working-directory: source
+        run: |
+          expected="$(node -p "require('./eng/dependencies.lock.json').webRuntime.commit")"
+          actual="$(git -C vendor/nexo-web rev-parse HEAD)"
+          [[ "$actual" == "$expected" ]] || { echo "Web runtime mismatch: $actual" >&2; exit 1; }
+
+      - name: Restore and test
+        working-directory: source
+        run: |
+          dotnet restore Nexo.Desktop.slnx --locked-mode
+          dotnet build Nexo.Desktop.slnx -c Release --no-restore
+          dotnet test Nexo.Desktop.slnx -c Release --no-restore --no-build
+          npm ci
+          npm test
+
+      - name: Publish Intel and Apple Silicon slices
+        working-directory: source
+        run: |
+          dotnet publish src/Nexo.Desktop/Nexo.Desktop.csproj -c Release -r osx-x64 --self-contained true --no-restore -o artifacts/publish/osx-x64
+          dotnet publish src/Nexo.Desktop/Nexo.Desktop.csproj -c Release -r osx-arm64 --self-contained true --no-restore -o artifacts/publish/osx-arm64
+          test "$(lipo -archs artifacts/publish/osx-x64/Nexo)" = "x86_64"
+          test "$(lipo -archs artifacts/publish/osx-arm64/Nexo)" = "arm64"
+          test ! -d artifacts/publish/osx-x64/libvlc
+          test ! -d artifacts/publish/osx-arm64/libvlc
