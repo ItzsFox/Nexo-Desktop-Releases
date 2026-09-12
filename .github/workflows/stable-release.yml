@@ -1,0 +1,346 @@
+name: Stable desktop release
+run-name: Nexo Desktop ${{ inputs.version }} from ${{ inputs.source_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit SHA, tag, or branch in the private Nexo-Desktop repository
+        required: true
+        default: main
+        type: string
+      version:
+        description: Stable MAJOR.MINOR.PATCH version
+        required: true
+        type: string
+      private_unsigned:
+        description: Build without Windows or Apple signing credentials
+        required: true
+        default: true
+        type: boolean
+      publish_release:
+        description: Publish or replace the matching public GitHub release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexo-desktop-stable-release
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  AVALONIA_TELEMETRY_OPTOUT: '1'
+  NUGET_XMLDOC_MODE: skip
+
+jobs:
+  validate:
+    name: Validate private source
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Require desktop deploy key
+        shell: bash
+        env:
+          DESKTOP_KEY: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+        run: test -n "$DESKTOP_KEY" || { echo '::error::Missing NEXO_DESKTOP_DEPLOY_KEY'; exit 1; }
+
+      - name: Check out private desktop source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ inputs.source_ref }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - id: source
+        name: Resolve immutable source commit
+        shell: bash
+        run: echo "sha=$(git -C source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - id: version
+        name: Validate stable version
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid stable version: $RELEASE_VERSION" >&2
+            exit 1
+          }
+          manifest_version="$(node -p "require('./source/eng/dependencies.lock.json').applicationVersion")"
+          [[ "$RELEASE_VERSION" == "$manifest_version" ]] || {
+            echo "Source declares $manifest_version, not $RELEASE_VERSION" >&2
+            exit 1
+          }
+          echo "value=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build Windows release
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Require private-source deploy keys
+        shell: bash
+        env:
+          DESKTOP_KEY: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          WEB_KEY: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+        run: |
+          [[ -n "$DESKTOP_KEY" ]] || { echo '::error::Missing NEXO_DESKTOP_DEPLOY_KEY'; exit 1; }
+          [[ -n "$WEB_KEY" ]] || { echo '::error::Missing NEXO_WEB_DEPLOY_KEY'; exit 1; }
+
+      - name: Check out private desktop source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - id: web-runtime
+        name: Resolve pinned private web runtime
+        shell: bash
+        run: echo "commit=$(git -C source rev-parse 'HEAD:vendor/nexo-web')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned private web runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo
+          ref: ${{ steps.web-runtime.outputs.commit }}
+          path: source/vendor/nexo-web
+          ssh-key: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Import trusted Windows signing certificate
+        if: ${{ !inputs.private_unsigned }}
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { throw 'WINDOWS_CERTIFICATE_BASE64 is required.' }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'nexo-windows-signing.pfx'
+          [System.IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $securePassword = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          if ($null -eq $certificate) { throw 'The Windows signing certificate could not be imported.' }
+          "NEXO_WINDOWS_SIGN_PARAMS=/sha1 $($certificate.Thumbprint) /fd SHA256 /tr http://timestamp.digicert.com /td SHA256" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build Windows release
+        shell: pwsh
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $packageParameters = @{
+            Version = '${{ needs.validate.outputs.version }}'
+            DownloadPrevious = $true
+          }
+          if ('${{ inputs.private_unsigned }}' -eq 'true') {
+            $packageParameters.Unsigned = $true
+          }
+          & ./scripts/package-windows.ps1 @packageParameters
+
+      - name: Upload Windows release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: public-win-x64
+          path: source/artifacts/releases/win-x64/*
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: Build universal macOS release
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - name: Require private-source deploy keys
+        shell: bash
+        env:
+          DESKTOP_KEY: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          WEB_KEY: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+        run: |
+          [[ -n "$DESKTOP_KEY" ]] || { echo '::error::Missing NEXO_DESKTOP_DEPLOY_KEY'; exit 1; }
+          [[ -n "$WEB_KEY" ]] || { echo '::error::Missing NEXO_WEB_DEPLOY_KEY'; exit 1; }
+
+      - name: Check out private desktop source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - id: web-runtime
+        name: Resolve pinned private web runtime
+        shell: bash
+        run: echo "commit=$(git -C source rev-parse 'HEAD:vendor/nexo-web')" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned private web runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo
+          ref: ${{ steps.web-runtime.outputs.commit }}
+          path: source/vendor/nexo-web
+          ssh-key: ${{ secrets.NEXO_WEB_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Select Xcode 16.4
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Install VLC build prerequisites
+        run: brew install autoconf automake libtool pkg-config gettext cmake ninja nasm yasm
+
+      - name: Import Apple certificates and create notary profile
+        if: ${{ !inputs.private_unsigned }}
+        shell: bash
+        env:
+          APP_CERTIFICATE_BASE64: ${{ secrets.APPLE_APPLICATION_CERTIFICATE_BASE64 }}
+          APP_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_APPLICATION_CERTIFICATE_PASSWORD }}
+          INSTALLER_CERTIFICATE_BASE64: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_BASE64 }}
+          INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${APP_CERTIFICATE_BASE64:?Missing Apple application certificate}"
+          : "${INSTALLER_CERTIFICATE_BASE64:?Missing Apple installer certificate}"
+          keychain="$RUNNER_TEMP/nexo-signing.keychain-db"
+          app_p12="$RUNNER_TEMP/application.p12"
+          installer_p12="$RUNNER_TEMP/installer.p12"
+          echo "$APP_CERTIFICATE_BASE64" | base64 --decode > "$app_p12"
+          echo "$INSTALLER_CERTIFICATE_BASE64" | base64 --decode > "$installer_p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$app_p12" -P "$APP_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security import "$installer_p12" -P "$INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          xcrun notarytool store-credentials --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --keychain "$keychain" nexo-velopack
+          echo "NEXO_APPLE_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build universal LGPL LibVLC
+        working-directory: source
+        run: bash ./scripts/build-libvlc-macos.sh
+
+      - name: Build universal macOS release
+        shell: bash
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXO_DOWNLOAD_PREVIOUS: '1'
+          NEXO_PRIVATE_UNSIGNED: ${{ inputs.private_unsigned }}
+          NEXO_APPLE_APPLICATION_IDENTITY: ${{ secrets.APPLE_APPLICATION_IDENTITY }}
+          NEXO_APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+          NEXO_APPLE_NOTARY_PROFILE: nexo-velopack
+        run: |
+          if [[ "$NEXO_PRIVATE_UNSIGNED" == "true" ]]; then
+            export NEXO_UNSIGNED=1
+          fi
+          bash ./scripts/package-macos.sh '${{ needs.validate.outputs.version }}'
+
+      - name: Remove temporary keychain
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${NEXO_APPLE_KEYCHAIN:-}" && -f "$NEXO_APPLE_KEYCHAIN" ]]; then
+            security delete-keychain "$NEXO_APPLE_KEYCHAIN"
+          fi
+
+      - name: Upload macOS release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: public-osx-universal
+          path: source/artifacts/releases/osx-universal/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish public release
+    if: ${{ inputs.publish_release }}
+    needs: [validate, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes from private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: public-*
+          path: public
+          merge-multiple: true
+
+      - name: Verify public artifact allowlist and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            case "$name" in
+              Nexo-Setup.exe|Nexo-macOS-universal.pkg|*.nupkg|*.zip|releases.*.json|assets.*.json|RELEASES-*|SHA256SUMS.*.txt) ;;
+              *) echo "Refusing to publish unexpected artifact: $name" >&2; exit 1 ;;
+            esac
+          done < <(find public -type f -print0)
+          (cd public && sha256sum --check SHA256SUMS.win-x64.txt)
+          (cd public && sha256sum --check SHA256SUMS.osx-universal.txt)
+          (cd public && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+
+      - name: Publish immutable release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          repo='ItzsFox/Nexo-Desktop-Releases'
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$repo" --title "Nexo Desktop $tag" --notes-file source/eng/release-notes.md --latest
+            gh release upload "$tag" public/* --repo "$repo" --clobber
+          else
+            gh release create "$tag" public/* --repo "$repo" --title "Nexo Desktop $tag" --notes-file source/eng/release-notes.md --latest
+          fi

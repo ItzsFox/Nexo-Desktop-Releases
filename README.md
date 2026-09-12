@@ -24,3 +24,16 @@ The workflow intentionally has no `pull_request` or `push` trigger. This prevent
 untrusted public contributions from receiving private-source credentials. Build
 logs in this repository are public, so the workflow also avoids caches, debug
 dumps, and artifact uploads.
+
+## Stable releases
+
+`Stable desktop release` builds the Windows and universal macOS packages from an
+immutable private source commit. Publishing is a separate Boolean input and is
+disabled by default, allowing the complete package gates to be tested safely.
+Only release installers, update packages, manifests, checksums, and compliance
+archives are transferred between jobs; retained artifacts expire after one day.
+
+Unsigned builds need only the two deploy-key secrets above. Signed builds also
+require the Windows and Apple certificate/notarization secrets named in the
+workflow. The workflow is manual-only so public pull requests and pushes cannot
+access any private-source or signing credential.
