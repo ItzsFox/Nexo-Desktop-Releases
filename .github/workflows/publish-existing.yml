@@ -1,0 +1,110 @@
+name: Publish existing build
+run-name: Publish release artifacts from run ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Completed stable build run ID (the number in its Actions URL)
+        required: true
+        type: string
+
+concurrency:
+  group: nexo-desktop-stable-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    name: Publish public release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate completed build and retained artifacts
+        id: build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.run_id }}
+        run: python3 .github/scripts/validate_release_run.py
+
+      - name: Check out release notes and verifier from original source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ItzsFox/Nexo-Desktop
+          ref: ${{ steps.build.outputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.NEXO_DESKTOP_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Confirm original source version
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.build.outputs.version }}
+          SOURCE_SHA: ${{ steps.build.outputs.source_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content source/eng/dependencies.lock.json -Raw | ConvertFrom-Json
+          if ($manifest.applicationVersion -ne $env:RELEASE_VERSION) { throw 'Source version does not match the build.' }
+          $actualSource = (& git -C source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualSource -ne $env:SOURCE_SHA) { throw 'Source commit does not match the build.' }
+
+      - name: Download original release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ steps.build.outputs.artifact_ids }}
+          path: source/artifacts/publish-existing
+          merge-multiple: false
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Verify release allowlist, packages, manifests and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $platforms = @('public-win-x64', 'public-osx-universal')
+          foreach ($platform in $platforms) {
+            $path = [System.IO.Path]::GetFullPath("source/artifacts/publish-existing/$platform")
+            & ./source/scripts/verify-release.ps1 -Kind ReleaseDirectory -Path $path
+          }
+          New-Item -ItemType Directory -Path public -ErrorAction Stop | Out-Null
+          foreach ($platform in $platforms) {
+            foreach ($file in (Get-ChildItem "source/artifacts/publish-existing/$platform" -File)) {
+              $destination = Join-Path public $file.Name
+              if (Test-Path -LiteralPath $destination) { throw "Duplicate release filename: $($file.Name)" }
+              Copy-Item -LiteralPath $file.FullName -Destination $destination
+            }
+          }
+          $checksums = Get-ChildItem public -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $checksums | Set-Content public/SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+          BUILD_WORKFLOW_SHA: ${{ steps.build.outputs.public_sha }}
+          SOURCE_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          repo="$GITHUB_REPOSITORY"
+          gh release create "$tag" public/* --repo "$repo" \
+            --target "$BUILD_WORKFLOW_SHA" --title "Nexo Desktop $tag" \
+            --notes-file source/eng/release-notes.md --latest
+          url="$(gh release view "$tag" --repo "$repo" --json url --jq .url)"
+          echo "Published [$tag]($url) using artifacts from [run $SOURCE_RUN_ID](https://github.com/$repo/actions/runs/$SOURCE_RUN_ID)." >> "$GITHUB_STEP_SUMMARY"
