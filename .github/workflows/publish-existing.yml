@@ -103,8 +103,12 @@ jobs:
           set -euo pipefail
           tag="v$VERSION"
           repo="$GITHUB_REPOSITORY"
+          # No --target: GITHUB_TOKEN cannot create a tag on a commit that changes
+          # workflow files (that needs the workflows permission), so the tag goes
+          # on the default branch like stable-release.yml and the summary records
+          # the exact build commit instead.
           gh release create "$tag" public/* --repo "$repo" \
-            --target "$BUILD_WORKFLOW_SHA" --title "Nexo Desktop $tag" \
+            --title "Nexo Desktop $tag" \
             --notes-file source/eng/release-notes.md --latest
           url="$(gh release view "$tag" --repo "$repo" --json url --jq .url)"
-          echo "Published [$tag]($url) using artifacts from [run $SOURCE_RUN_ID](https://github.com/$repo/actions/runs/$SOURCE_RUN_ID)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Published [$tag]($url) using artifacts from [run $SOURCE_RUN_ID](https://github.com/$repo/actions/runs/$SOURCE_RUN_ID), built from publisher commit $BUILD_WORKFLOW_SHA." >> "$GITHUB_STEP_SUMMARY"
